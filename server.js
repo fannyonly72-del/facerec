@@ -230,6 +230,120 @@ app.get('/api/attendance/today', async (req, res) => {
     }
 });
 
+
+// ========== EMPLOYEE REGISTRATION ENDPOINT ==========
+// Add this to your server code
+
+// Register new employee with face data
+app.post('/api/employees/register', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        const { employee_id, name, face_image_base64, department, role, birthday, contact_number, email } = req.body;
+        
+        console.log(`👤 Registering employee: ${name} (${employee_id})`);
+        
+        // Check if employee already exists
+        const existing = await db.collection('employee_faces').findOne({
+            employee_id: employee_id
+        });
+        
+        if (existing) {
+            console.log(`⚠️ Employee already exists: ${name}`);
+            return res.json({ 
+                success: false, 
+                message: "Employee ID already exists" 
+            });
+        }
+        
+        // Generate a unique employee_id if not provided
+        const finalEmployeeId = employee_id || `EMP${Date.now()}`;
+        
+        // Create employee record
+        const employee = {
+            employee_id: finalEmployeeId,
+            name: name,
+            face_image_base64: face_image_base64,
+            department: department || "General",
+            role: role || "Employee",
+            birthday: birthday || null,
+            contact_number: contact_number || null,
+            email: email || null,
+            status: "active",
+            has_face_data: true,
+            source: "android_app",
+            created_at: new Date(),
+            updated_at: new Date()
+        };
+        
+        const result = await db.collection('employee_faces').insertOne(employee);
+        
+        console.log(`✅ Employee registered: ${name} with ID: ${finalEmployeeId}`);
+        
+        res.json({
+            success: true,
+            message: "Employee registered successfully",
+            employee_id: finalEmployeeId,
+            mongo_id: result.insertedId
+        });
+    } catch (error) {
+        console.error("❌ Employee registration error:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
+// Update employee face data
+app.put('/api/employees/:id/face', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        const { face_image_base64 } = req.body;
+        
+        const result = await db.collection('employee_faces').updateOne(
+            { employee_id: req.params.id },
+            { 
+                $set: { 
+                    face_image_base64: face_image_base64,
+                    has_face_data: true,
+                    updated_at: new Date()
+                } 
+            }
+        );
+        
+        if (result.modifiedCount > 0) {
+            console.log(`✅ Face data updated for employee: ${req.params.id}`);
+            res.json({ 
+                success: true, 
+                message: "Face data updated successfully" 
+            });
+        } else {
+            res.json({ 
+                success: false, 
+                message: "Employee not found or no changes made" 
+            });
+        }
+    } catch (error) {
+        console.error("❌ Face update error:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
 // ========== SYNC ENDPOINT ==========
 
 // Sync pending attendance (for offline mode)
