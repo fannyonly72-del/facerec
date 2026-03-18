@@ -113,9 +113,9 @@ app.get('/api/employees/list', async (req, res) => {
             });
         }
         
-        // Only return id, employee_id, and name for dropdown
+        // REMOVE the status filter - get ALL employees
         const employees = await db.collection('employee_faces')
-            .find({ status: "active" })
+            .find({})  // ← Changed from { status: "active" } to {}
             .project({ 
                 _id: 1, 
                 employee_id: 1, 
