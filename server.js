@@ -39,7 +39,53 @@ async function connectDB() {
 
 connectDB();
 
+
+app.get('/api/test', (req, res) => {
+    res.json({ 
+        success: true, 
+        message: "Server is working!",
+        timestamp: new Date().toISOString()
+    });
+});
+
 // ========== EMPLOYEE ENDPOINTS ==========
+
+app.get('/api/employees/list', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        // REMOVE the status filter - get ALL employees
+        const employees = await db.collection('employee_faces')
+            .find({})  // ← Changed from { status: "active" } to {}
+            .project({ 
+                _id: 1, 
+                employee_id: 1, 
+                name: 1,
+                department: 1,
+                role: 1
+            })
+            .toArray();
+        
+        console.log(`📋 Found ${employees.length} employees for dropdown`);
+        
+        res.json({
+            success: true,
+            employees: employees,
+            count: employees.length
+        });
+    } catch (error) {
+        console.error("❌ Error fetching employee list:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
 
 // Get all employees with face data
 app.get('/api/employees', async (req, res) => {
@@ -103,43 +149,6 @@ app.get('/api/employees/:id', async (req, res) => {
     }
 });
 
-// Get all employees (simplified list for dropdown)
-app.get('/api/employees/list', async (req, res) => {
-    try {
-        if (!isConnected) {
-            return res.status(503).json({ 
-                success: false, 
-                message: "Database not connected" 
-            });
-        }
-        
-        // REMOVE the status filter - get ALL employees
-        const employees = await db.collection('employee_faces')
-            .find({})  // ← Changed from { status: "active" } to {}
-            .project({ 
-                _id: 1, 
-                employee_id: 1, 
-                name: 1,
-                department: 1,
-                role: 1
-            })
-            .toArray();
-        
-        console.log(`📋 Found ${employees.length} employees for dropdown`);
-        
-        res.json({
-            success: true,
-            employees: employees,
-            count: employees.length
-        });
-    } catch (error) {
-        console.error("❌ Error fetching employee list:", error);
-        res.status(500).json({ 
-            success: false, 
-            message: error.message 
-        });
-    }
-});
 
 // ========== ATTENDANCE ENDPOINTS ==========
 
