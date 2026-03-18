@@ -103,6 +103,44 @@ app.get('/api/employees/:id', async (req, res) => {
     }
 });
 
+// Get all employees (simplified list for dropdown)
+app.get('/api/employees/list', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        // Only return id, employee_id, and name for dropdown
+        const employees = await db.collection('employee_faces')
+            .find({ status: "active" })
+            .project({ 
+                _id: 1, 
+                employee_id: 1, 
+                name: 1,
+                department: 1,
+                role: 1
+            })
+            .toArray();
+        
+        console.log(`📋 Found ${employees.length} employees for dropdown`);
+        
+        res.json({
+            success: true,
+            employees: employees,
+            count: employees.length
+        });
+    } catch (error) {
+        console.error("❌ Error fetching employee list:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
 // ========== ATTENDANCE ENDPOINTS ==========
 
 // Clock in
@@ -302,7 +340,7 @@ app.post('/api/employees/register', async (req, res) => {
 });
 
 // Update employee face data
-app.put('/api/employees/:id/face', async (req, res) => {
+app.put('/api/employees/:employeeId/face', async (req, res) => {
     try {
         if (!isConnected) {
             return res.status(503).json({ 
@@ -311,29 +349,53 @@ app.put('/api/employees/:id/face', async (req, res) => {
             });
         }
         
+        const { employeeId } = req.params;
         const { face_image_base64 } = req.body;
         
+        console.log(`🔄 Updating face data for employee: ${employeeId}`);
+        
+        // Find employee by employee_id (not _id)
+        const existing = await db.collection('employee_faces').findOne({
+            employee_id: employeeId
+        });
+        
+        if (!existing) {
+            console.log(`❌ Employee not found: ${employeeId}`);
+            return res.status(404).json({ 
+                success: false, 
+                message: "Employee not found" 
+            });
+        }
+        
+        // Update ONLY the face_image_base64 field
         const result = await db.collection('employee_faces').updateOne(
-            { employee_id: req.params.id },
+            { employee_id: employeeId },
             { 
                 $set: { 
                     face_image_base64: face_image_base64,
                     has_face_data: true,
                     updated_at: new Date()
-                } 
+                }
+                // DO NOT change employee_id, name, department, role, etc.
             }
         );
         
         if (result.modifiedCount > 0) {
-            console.log(`✅ Face data updated for employee: ${req.params.id}`);
+            console.log(`✅ Face data updated for employee: ${existing.name} (${employeeId})`);
             res.json({ 
                 success: true, 
-                message: "Face data updated successfully" 
+                message: "Face data updated successfully",
+                employee: {
+                    employee_id: existing.employee_id,
+                    name: existing.name,
+                    department: existing.department,
+                    role: existing.role
+                }
             });
         } else {
             res.json({ 
                 success: false, 
-                message: "Employee not found or no changes made" 
+                message: "No changes made" 
             });
         }
     } catch (error) {
