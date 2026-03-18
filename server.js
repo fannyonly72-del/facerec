@@ -162,13 +162,14 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             });
         }
         
-        const { employee_id, name, clock_in_time, date } = req.body;
+        // CHANGED: Use 'name' as the identifier instead of employee_id
+        const { name, clock_in_time, date } = req.body;
         
-        console.log(`⏰ Clock-in: ${name} (${employee_id}) at ${clock_in_time} on ${date}`);
+        console.log(`⏰ Clock-in: ${name} at ${clock_in_time} on ${date}`);
         
-        // Check if already clocked in today
+        // Check if already clocked in today - using name as identifier
         const existing = await db.collection('attendance_records').findOne({
-            employee_id: employee_id,
+            name: name,  // Using name instead of employee_id
             date: date
         });
         
@@ -180,10 +181,9 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             });
         }
         
-        // Create attendance record
+        // Create attendance record - NO employee_id field
         const record = {
-            employee_id,
-            name,
+            name,  // name is now the identifier
             clock_in_time,
             date,
             timestamp: new Date(),
@@ -218,23 +218,24 @@ app.post('/api/attendance/clock-out', async (req, res) => {
             });
         }
         
-        const { employee_id, clock_out_time, date } = req.body;
+        // CHANGED: Use 'name' as the identifier instead of employee_id
+        const { name, clock_out_time, date } = req.body;
         
-        console.log(`⏰ Clock-out: ${employee_id} at ${clock_out_time}`);
+        console.log(`⏰ Clock-out: ${name} at ${clock_out_time}`);
         
         const result = await db.collection('attendance_records').updateOne(
-            { employee_id: employee_id, date: date },
+            { name: name, date: date },  // Using name instead of employee_id
             { $set: { clock_out_time: clock_out_time } }
         );
         
         if (result.modifiedCount > 0) {
-            console.log(`✅ Clock-out recorded`);
+            console.log(`✅ Clock-out recorded for ${name}`);
             res.json({ 
                 success: true, 
                 message: "Clocked out successfully" 
             });
         } else {
-            console.log(`⚠️ No clock-in record found`);
+            console.log(`⚠️ No clock-in record found for ${name}`);
             res.json({ 
                 success: false, 
                 message: "No clock-in record found" 
@@ -437,13 +438,12 @@ app.post('/api/sync/attendance', async (req, res) => {
             if (!record.clock_out_time) {
                 // Clock-in record
                 const existing = await db.collection('attendance_records').findOne({
-                    employee_id: record.employee_id,
+                    name: record.name,  // Using name instead of employee_id
                     date: record.date
                 });
                 
                 if (!existing) {
                     const result = await db.collection('attendance_records').insertOne({
-                        employee_id: record.employee_id,
                         name: record.name,
                         clock_in_time: record.clock_in_time,
                         date: record.date,
@@ -459,7 +459,7 @@ app.post('/api/sync/attendance', async (req, res) => {
             } else {
                 // Clock-out record
                 const result = await db.collection('attendance_records').updateOne(
-                    { employee_id: record.employee_id, date: record.date },
+                    { name: record.name, date: record.date },  // Using name instead of employee_id
                     { $set: { clock_out_time: record.clock_out_time } }
                 );
                 results.push({ 
