@@ -114,7 +114,7 @@ async function getEmployeeDepartment(employeeName) {
     }
 }
 
-// Create late violation (FIXED - use correct ems_violations database)
+// Create late violation (UPDATED with correct schema and employeeId lookup)
 async function createLateViolation(employeeName, clockInTime, attendanceDate, shiftType, gracePeriodMinutes, lateMinutes) {
     try {
         if (!isConnected) {
@@ -122,58 +122,84 @@ async function createLateViolation(employeeName, clockInTime, attendanceDate, sh
             return null;
         }
         
-        // Get employee department
-        const department = await getEmployeeDepartment(employeeName);
+        console.log(`\n📝 Creating violation for: ${employeeName}`);
         
-        // Calculate late minutes rounded up
+        // STEP 1: Get employeeId from attendance_system.employee_faces
+        let employeeId = null;
+        let department = "Unknown";
+        
+        try {
+            // Look up employee by name in attendance_system.employee_faces
+            const employee = await db.collection('employee_faces').findOne({ 
+                name: employeeName 
+            });
+            
+            if (employee) {
+                employeeId = employee.employee_id;
+                department = employee.department || "Unknown";
+                console.log(`   Found employee ID: ${employeeId}`);
+                console.log(`   Department: ${department}`);
+            } else {
+                console.log(`   ⚠️ Employee not found in employee_faces for name: ${employeeName}`);
+                employeeId = `UNKNOWN_${employeeName.replace(/\s/g, '_')}`;
+            }
+        } catch (error) {
+            console.error(`   Error looking up employee: ${error.message}`);
+            employeeId = `UNKNOWN_${employeeName.replace(/\s/g, '_')}`;
+        }
+        
+        // STEP 2: Calculate late minutes rounded up
         const lateMinutesRounded = Math.ceil(lateMinutes);
         
-        // Create description
+        // STEP 3: Create description based on shift type
         let description = "";
         if (shiftType === "Morning") {
             description = `Morning shift late: Clocked in at ${clockInTime} (${lateMinutesRounded} minute${lateMinutesRounded !== 1 ? 's' : ''} after ${gracePeriodMinutes}-minute grace period)`;
+        } else if (shiftType === "Night") {
+            description = `Night shift late: Clocked in at ${clockInTime} (${lateMinutesRounded} minute${lateMinutesRounded !== 1 ? 's' : ''} after 1:00 AM)`;
         } else {
-            description = `Night shift late: Clocked in at ${clockInTime} (${lateMinutesRounded} minute${lateMinutesRounded !== 1 ? 's' : ''} after ${gracePeriodMinutes}-minute grace period)`;
+            description = `Late: Clocked in at ${clockInTime} (${lateMinutesRounded} minute${lateMinutesRounded !== 1 ? 's' : ''} late)`;
         }
         
-        // IMPORTANT: Use ems_violations database, NOT attendance_system
+        // STEP 4: Use ems_violations database
         const violationsDb = client.db("ems_violations");
-        
-        // Get the collection (MongoDB will create it automatically on first insert)
         const violationsCollection = violationsDb.collection("employee_violations");
         
-        // Check if violation already exists
+        // STEP 5: Check if violation already exists for this employee on this date
         const existingViolation = await violationsCollection.findOne({
-            employeeName: employeeName,
+            employeeId: employeeId,
             date: attendanceDate,
             violationType: "Tardiness"
         });
         
         if (existingViolation) {
-            console.log(`⚠️ Tardiness violation already exists for ${employeeName} on ${attendanceDate}`);
+            console.log(`⚠️ Tardiness violation already exists for ${employeeName} (${employeeId}) on ${attendanceDate}`);
             return null;
         }
         
-        // Create violation document
+        // STEP 6: Create violation document with correct schema
         const violation = {
-            employeeName: employeeName,
-            department: department,
-            violationType: "Tardiness",
-            description: description,
-            status: "Pending",
-            severity: "Low",
-            date: attendanceDate,
-            clockInTime: clockInTime,
-            shiftType: shiftType.toLowerCase(),
-            lateMinutes: lateMinutesRounded,
-            gracePeriodMinutes: gracePeriodMinutes,
-            createdAt: new Date(),
-            source: "auto_late_detection"
+            employeeId: employeeId,           // e.g., "GREMP004"
+            employeeName: employeeName,        // e.g., "Jan Mark F. Selge"
+            department: department,            // e.g., "Graphics"
+            violationType: "Tardiness",        // Fixed value
+            description: description,          // Generated description
+            status: "Pending",                 // Default status
+            severity: "High",                  // Set to High for tardiness
+            createdAt: new Date(),             // Current timestamp
+            source: "auto_late_detection"      // Source of creation
         };
+        
+        console.log(`📤 Inserting violation:`);
+        console.log(`   employeeId: ${violation.employeeId}`);
+        console.log(`   employeeName: ${violation.employeeName}`);
+        console.log(`   department: ${violation.department}`);
+        console.log(`   description: ${violation.description}`);
         
         const result = await violationsCollection.insertOne(violation);
         
-        console.log(`✅ Created ${shiftType} shift tardiness violation for ${employeeName} (${lateMinutesRounded} min late)`);
+        console.log(`✅ Created tardiness violation for ${employeeName} (${employeeId})`);
+        console.log(`   Late minutes: ${lateMinutesRounded}`);
         console.log(`   Database: ems_violations`);
         console.log(`   Collection: employee_violations`);
         console.log(`   ID: ${result.insertedId}`);
@@ -298,7 +324,7 @@ app.get('/api/employees/:id', async (req, res) => {
 
 // ========== ATTENDANCE ENDPOINTS ==========
 
-// Clock in (UPDATED with late detection)
+// Clock in (UPDATED with proper late detection)
 app.post('/api/attendance/clock-in', async (req, res) => {
     try {
         if (!isConnected) {
@@ -339,30 +365,39 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         let lateMinutes = 0;
         let violationId = null;
         
-        // Determine shift type
+        // Determine shift type based on time
+        // Night shift: 10:00 PM (22:00) to 6:00 AM (06:00) next day
         const isNightShift = clockInMinutes >= (22 * 60) || clockInMinutes <= (6 * 60);
-        shiftType = isNightShift ? "Night" : "Morning";
         
-        if (!isNightShift) {
-            // Morning shift late detection
-            if (clockInMinutes > lateThresholdMinutes) {
-                isLate = true;
-                lateMinutes = clockInMinutes - lateThresholdMinutes;
-                console.log(`⚠️ MORNING LATE: ${name} at ${clock_in_time} (${Math.ceil(lateMinutes)} min late)`);
-            } else {
-                console.log(`✅ On time: ${name} at ${clock_in_time}`);
-            }
-        } else {
-            // Night shift late detection (1:00 AM - 5:00 AM)
-            const nightStart = timeToMinutes("01:00");
-            const nightEnd = timeToMinutes("05:00");
+        if (isNightShift) {
+            shiftType = "Night";
+            console.log(`🌙 Night shift detected: ${clock_in_time}`);
+            
+            // Night shift late detection: 1:00 AM to 5:00 AM is considered late
+            const nightStart = timeToMinutes("01:00");  // 1:00 AM
+            const nightEnd = timeToMinutes("05:00");    // 5:00 AM
             
             if (clockInMinutes >= nightStart && clockInMinutes <= nightEnd) {
                 isLate = true;
                 lateMinutes = clockInMinutes - nightStart;
-                console.log(`⚠️ NIGHT LATE: ${name} at ${clock_in_time} (${Math.ceil(lateMinutes)} min late)`);
+                console.log(`⚠️ NIGHT LATE: ${name} at ${clock_in_time} (${Math.ceil(lateMinutes)} min after 1:00 AM)`);
+            } else if (clockInMinutes === 0 || clockInMinutes < nightStart) {
+                // Midnight to 12:59 AM is on time for night shift
+                console.log(`✅ Night shift on time: ${name} at ${clock_in_time} (within grace period)`);
             } else {
                 console.log(`✅ Night shift on time: ${name} at ${clock_in_time}`);
+            }
+        } else {
+            // Morning shift (6:01 AM to 9:59 PM)
+            shiftType = "Morning";
+            
+            // Morning shift late detection
+            if (clockInMinutes > lateThresholdMinutes) {
+                isLate = true;
+                lateMinutes = clockInMinutes - lateThresholdMinutes;
+                console.log(`⚠️ MORNING LATE: ${name} at ${clock_in_time} (${Math.ceil(lateMinutes)} min after ${lateThresholdTime})`);
+            } else {
+                console.log(`✅ On time: ${name} at ${clock_in_time}`);
             }
         }
         
@@ -374,7 +409,8 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             timestamp: new Date(),
             sync_status: "synced",
             late_status: isLate ? "late" : "on_time",
-            late_minutes: isLate ? Math.ceil(lateMinutes) : 0
+            late_minutes: isLate ? Math.ceil(lateMinutes) : 0,
+            shift_type: shiftType.toLowerCase()
         };
         
         const result = await db.collection('attendance_records').insertOne(record);
@@ -384,10 +420,10 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         // Create violation if late
         if (isLate) {
             violationId = await createLateViolation(
-                name,
-                clock_in_time,
-                date,
-                shiftType,
+                name,           // employeeName
+                clock_in_time,  // clockInTime
+                date,           // attendanceDate
+                shiftType,      // shiftType
                 gracePeriodMinutes,
                 lateMinutes
             );
@@ -397,7 +433,8 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         const response = {
             success: true,
             message: "Clocked in successfully",
-            record_id: result.insertedId
+            record_id: result.insertedId,
+            shift_type: shiftType.toLowerCase()
         };
         
         if (isLate) {
@@ -410,6 +447,7 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             if (violationId) {
                 response.late_detection.violation_id = violationId;
             }
+            response.message += ` (⚠️ ${Math.ceil(lateMinutes)} minute${lateMinutes !== 1 ? 's' : ''} late for ${shiftType} shift)`;
         }
         
         res.json(response);
