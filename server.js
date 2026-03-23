@@ -885,6 +885,42 @@ app.post('/api/attendance/check-late-violations', async (req, res) => {
 });
 
 // ========== SYNC ENDPOINT ==========
+app.get('/api/attendance/cloud-records', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        const { date } = req.query;
+        
+        if (!date) {
+            return res.status(400).json({ 
+                success: false, 
+                message: "Date parameter required" 
+            });
+        }
+        
+        const records = await db.collection('attendance_records')
+            .find({ date: date })
+            .toArray();
+        
+        res.json({
+            success: true,
+            records: records,
+            count: records.length
+        });
+        
+    } catch (error) {
+        console.error("❌ Error fetching cloud records:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
 
 // Sync pending attendance (for offline mode)
 app.post('/api/sync/attendance', async (req, res) => {
@@ -950,6 +986,7 @@ app.post('/api/sync/attendance', async (req, res) => {
         });
     }
 });
+
 
 // Health check
 app.get('/health', (req, res) => {
