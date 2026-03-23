@@ -114,7 +114,7 @@ async function getEmployeeDepartment(employeeName) {
     }
 }
 
-// Create late violation
+// Create late violation (FIXED - use correct ems_violations database)
 async function createLateViolation(employeeName, clockInTime, attendanceDate, shiftType, gracePeriodMinutes, lateMinutes) {
     try {
         if (!isConnected) {
@@ -136,8 +136,14 @@ async function createLateViolation(employeeName, clockInTime, attendanceDate, sh
             description = `Night shift late: Clocked in at ${clockInTime} (${lateMinutesRounded} minute${lateMinutesRounded !== 1 ? 's' : ''} after ${gracePeriodMinutes}-minute grace period)`;
         }
         
-        // Check if violation already exists for this employee on this date
-        const existingViolation = await db.collection('employee_violations').findOne({
+        // IMPORTANT: Use ems_violations database, NOT attendance_system
+        const violationsDb = client.db("ems_violations");
+        
+        // Get the collection (MongoDB will create it automatically on first insert)
+        const violationsCollection = violationsDb.collection("employee_violations");
+        
+        // Check if violation already exists
+        const existingViolation = await violationsCollection.findOne({
             employeeName: employeeName,
             date: attendanceDate,
             violationType: "Tardiness"
@@ -165,14 +171,17 @@ async function createLateViolation(employeeName, clockInTime, attendanceDate, sh
             source: "auto_late_detection"
         };
         
-        const result = await db.collection('employee_violations').insertOne(violation);
+        const result = await violationsCollection.insertOne(violation);
         
         console.log(`✅ Created ${shiftType} shift tardiness violation for ${employeeName} (${lateMinutesRounded} min late)`);
+        console.log(`   Database: ems_violations`);
+        console.log(`   Collection: employee_violations`);
+        console.log(`   ID: ${result.insertedId}`);
         
         return result.insertedId;
         
     } catch (error) {
-        console.error("Error creating late violation:", error);
+        console.error("❌ Error creating late violation:", error);
         return null;
     }
 }
