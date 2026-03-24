@@ -1018,6 +1018,64 @@ app.get('/', (req, res) => {
     });
 });
 
+// ========== ATTENDANCE SETTINGS ENDPOINT ==========
+app.get('/api/attendance/settings', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        // Get settings from attendance_settings collection
+        const settings = await db.collection('attendance_settings').findOne({});
+        
+        if (settings) {
+            // Remove _id from response
+            delete settings._id;
+            
+            console.log("📋 Attendance settings retrieved");
+            
+            res.json({
+                success: true,
+                settings: settings
+            });
+        } else {
+            // Return default settings if none exist
+            const defaultSettings = {
+                clock_in_start: "08:00",
+                clock_in_end: "17:00",
+                clock_out_start: "17:00",
+                clock_out_end: "22:00",
+                grace_period_minutes: 15,
+                late_threshold: "08:16",
+                standard_work_hours: 8,
+                overtime_rate: 1.25,
+                sunday_rate: 1.30,
+                holiday_rate: 2.00,
+                night_shift_enabled: true,
+                night_shift_start: "22:00",
+                night_shift_end: "06:00"
+            };
+            
+            // Optionally save default settings to database
+            await db.collection('attendance_settings').insertOne(defaultSettings);
+            
+            res.json({
+                success: true,
+                settings: defaultSettings
+            });
+        }
+    } catch (error) {
+        console.error("❌ Error fetching attendance settings:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
 // Start server
 app.listen(port, () => {
     console.log(`\n🚀 Server is running!`);
