@@ -1186,6 +1186,214 @@ app.get('/api/attendance/settings', async (req, res) => {
     }
 });
 
+// ========== HARDWARE ID / DEVICE LOCK ENDPOINTS ==========
+
+// Register or update hardware device
+app.post('/api/hardware/register', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        const { device_id, device_name, device_model, android_version, app_version, last_seen } = req.body;
+        
+        console.log(`📱 Registering device: ${device_name} (${device_id})`);
+        
+        // Check if device already exists
+        const existing = await db.collection('hardware_id').findOne({ device_id: device_id });
+        
+        if (existing) {
+            // Update last seen
+            await db.collection('hardware_id').updateOne(
+                { device_id: device_id },
+                { 
+                    $set: { 
+                        last_seen: last_seen,
+                        device_name: device_name,
+                        device_model: device_model,
+                        android_version: android_version,
+                        app_version: app_version,
+                        updated_at: new Date()
+                    }
+                }
+            );
+            
+            console.log(`🔄 Updated device: ${device_id}, authorized: ${existing.is_authorized}`);
+            
+            return res.json({
+                success: true,
+                message: existing.is_authorized ? "Device is authorized" : "Waiting for authorization",
+                is_authorized: existing.is_authorized,
+                device: {
+                    device_id: existing.device_id,
+                    device_name: existing.device_name,
+                    device_model: existing.device_model,
+                    android_version: existing.android_version,
+                    app_version: existing.app_version,
+                    is_authorized: existing.is_authorized,
+                    authorized_at: existing.authorized_at,
+                    last_seen: existing.last_seen,
+                    created_at: existing.created_at
+                }
+            });
+        } else {
+            // Create new device request
+            const newDevice = {
+                device_id: device_id,
+                device_name: device_name,
+                device_model: device_model,
+                android_version: android_version,
+                app_version: app_version,
+                is_authorized: false,
+                authorized_at: null,
+                last_seen: last_seen,
+                created_at: new Date(),
+                updated_at: new Date()
+            };
+            
+            await db.collection('hardware_id').insertOne(newDevice);
+            
+            console.log(`🆕 New device registered: ${device_id}, awaiting approval`);
+            
+            res.json({
+                success: true,
+                message: "Device registered, waiting for admin approval",
+                is_authorized: false,
+                device: newDevice
+            });
+        }
+    } catch (error) {
+        console.error("❌ Hardware registration error:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
+// Get hardware status
+app.get('/api/hardware/status/:device_id', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        const { device_id } = req.params;
+        
+        const device = await db.collection('hardware_id').findOne({ device_id: device_id });
+        
+        if (!device) {
+            return res.json({
+                success: true,
+                message: "Device not registered",
+                is_authorized: false,
+                device: null
+            });
+        }
+        
+        res.json({
+            success: true,
+            message: device.is_authorized ? "Authorized" : "Pending",
+            is_authorized: device.is_authorized,
+            device: device
+        });
+    } catch (error) {
+        console.error("❌ Hardware status error:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
+// Authorize hardware device (ADMIN ENDPOINT)
+app.put('/api/hardware/authorize', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        const { device_id, is_authorized } = req.body;
+        
+        console.log(`🔐 Authorizing device: ${device_id} -> ${is_authorized}`);
+        
+        const updateData = {
+            is_authorized: is_authorized,
+            updated_at: new Date()
+        };
+        
+        if (is_authorized) {
+            updateData.authorized_at = new Date();
+        }
+        
+        const result = await db.collection('hardware_id').updateOne(
+            { device_id: device_id },
+            { $set: updateData }
+        );
+        
+        if (result.matchedCount === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Device not found"
+            });
+        }
+        
+        const updatedDevice = await db.collection('hardware_id').findOne({ device_id: device_id });
+        
+        console.log(`✅ Device ${device_id} authorization set to: ${is_authorized}`);
+        
+        res.json({
+            success: true,
+            message: `Device ${is_authorized ? "authorized" : "unauthorized"} successfully`,
+            device: updatedDevice
+        });
+    } catch (error) {
+        console.error("❌ Hardware authorization error:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
+// Get all pending hardware requests (ADMIN ENDPOINT)
+app.get('/api/hardware/pending', async (req, res) => {
+    try {
+        if (!isConnected) {
+            return res.status(503).json({ 
+                success: false, 
+                message: "Database not connected" 
+            });
+        }
+        
+        const pendingDevices = await db.collection('hardware_id')
+            .find({ is_authorized: false })
+            .sort({ created_at: -1 })
+            .toArray();
+        
+        res.json({
+            success: true,
+            devices: pendingDevices,
+            count: pendingDevices.length
+        });
+    } catch (error) {
+        console.error("❌ Error fetching pending devices:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
 // Start server
 app.listen(port, () => {
     console.log(`\n🚀 Server is running!`);
