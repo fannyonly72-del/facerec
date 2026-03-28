@@ -270,10 +270,13 @@ app.get('/api/employees', async (req, res) => {
         }
         
         const employees = await db.collection('employee_faces')
-            .find({ has_face_data: true })
+            .find({ 
+                has_face_data: true,
+                role: "Employee"
+            })
             .toArray();
         
-        console.log(`📊 Found ${employees.length} employees with face data`);
+        console.log(`📊 Found ${employees.length} employees with face data (Employee role only)`);
         
         res.json({
             success: true,
