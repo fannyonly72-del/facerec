@@ -497,23 +497,32 @@ app.post('/api/attendance/clock-out', async (req, res) => {
             });
         }
         
-        const { name, clock_out_time, date } = req.body;
+        const { name, clock_out_time, date, clock_out_date } = req.body;
         
         console.log(`⏰ Clock-out: ${name} at ${clock_out_time}`);
+        console.log(`📅 Clock-out date: ${clock_out_date || date}`);
+        
+        const finalClockOutDate = clock_out_date || date;
         
         const result = await db.collection('attendance_records').updateOne(
             { name: name, date: date },
-            { $set: { clock_out_time: clock_out_time } }
+            { 
+                $set: { 
+                    clock_out_time: clock_out_time,
+                    clock_out_date: finalClockOutDate 
+                } 
+            }
         );
         
         if (result.modifiedCount > 0) {
-            console.log(`✅ Clock-out recorded for ${name}`);
+            console.log(`✅ Clock-out recorded for ${name} on ${finalClockOutDate}`);
             res.json({ 
                 success: true, 
-                message: "Clocked out successfully" 
+                message: "Clocked out successfully",
+                clock_out_date: finalClockOutDate
             });
         } else {
-            console.log(`⚠️ No clock-in record found for ${name}`);
+            console.log(`⚠️ No clock-in record found for ${name} on ${date}`);
             res.json({ 
                 success: false, 
                 message: "No clock-in record found" 
@@ -1008,10 +1017,20 @@ app.post('/api/sync/attendance', async (req, res) => {
                     });
                 }
             } else {
-                // Clock-out record
+                // Clock-out record - UPDATED to include clock_out_date
+                const updateData = { 
+                    clock_out_time: record.clock_out_time 
+                };
+                
+                // Add clock_out_date if present in the record
+                if (record.clock_out_date) {
+                    updateData.clock_out_date = record.clock_out_date;
+                    console.log(`📅 Syncing clock_out_date: ${record.clock_out_date}`);
+                }
+                
                 const result = await db.collection('attendance_records').updateOne(
                     { name: record.name, date: record.date },
-                    { $set: { clock_out_time: record.clock_out_time } }
+                    { $set: updateData }
                 );
                 results.push({ 
                     id: record.local_id, 
