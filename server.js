@@ -1122,7 +1122,11 @@ app.get('/', (req, res) => {
             'POST /api/sync/attendance',
             'GET /api/violations',
             'GET /api/violations/employee/:employeeName',
-            'POST /api/attendance/check-late-violations'
+            'POST /api/attendance/check-late-violations',
+            'GET /api/hardware/status/:device_id',
+            'POST /api/hardware/register',
+            'PUT /api/hardware/authorize',
+            'GET /api/hardware/pending'
         ],
         mongodb_status: isConnected ? '✅ Connected' : '❌ Disconnected'
     });
@@ -1410,5 +1414,9 @@ app.listen(port, () => {
     console.log(`   GET  /api/violations`);
     console.log(`   GET  /api/violations/employee/:employeeName`);
     console.log(`   POST /api/attendance/check-late-violations`);
+    console.log(`   POST /api/hardware/register`);
+    console.log(`   GET  /api/hardware/status/:id`);
+    console.log(`   PUT  /api/hardware/authorize`);
+    console.log(`   GET  /api/hardware/pending`);
     console.log(`\n⏰ Press Ctrl+C to stop\n`);
 });
