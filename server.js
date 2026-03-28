@@ -231,9 +231,9 @@ app.get('/api/employees/list', async (req, res) => {
             });
         }
         
-        // REMOVE the status filter - get ALL employees
+        // Filter ONLY employees with role "Employee"
         const employees = await db.collection('employee_faces')
-            .find({})  // ← Changed from { status: "active" } to {}
+            .find({ role: "Employee" })
             .project({ 
                 _id: 1, 
                 employee_id: 1, 
@@ -243,7 +243,7 @@ app.get('/api/employees/list', async (req, res) => {
             })
             .toArray();
         
-        console.log(`📋 Found ${employees.length} employees for dropdown`);
+        console.log(`📋 Found ${employees.length} employees for dropdown (Employee role only)`);
         
         res.json({
             success: true,
@@ -270,13 +270,10 @@ app.get('/api/employees', async (req, res) => {
         }
         
         const employees = await db.collection('employee_faces')
-            .find({ 
-                has_face_data: true,
-                role: "Employee"
-            })
+            .find({ has_face_data: true })
             .toArray();
         
-        console.log(`📊 Found ${employees.length} employees with face data (Employee role only)`);
+        console.log(`📊 Found ${employees.length} employees with face data`);
         
         res.json({
             success: true,
