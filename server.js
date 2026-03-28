@@ -338,6 +338,10 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         
         console.log(`⏰ Clock-in: ${name} at ${clock_in_time} on ${date}`);
         
+        // Parse clock-in hour to determine if it's night shift
+        const clockInHour = parseInt(clock_in_time.split(':')[0]);
+        const isNightShiftClockIn = (clockInHour >= 22 || clockInHour <= 6);
+        
         // Check if already clocked in today
         const existing = await db.collection('attendance_records').findOne({
             name: name,
@@ -352,9 +356,7 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             });
         }
  
-        // FIX: Check for an active (unfinished) night shift record from yesterday
-        // This prevents a night shift employee from clocking in for morning
-        // after their date rolls over past nightShiftEnd (06:00)
+        // ===== CHECK 1: Active night shift (not clocked out) =====
         const yesterday = new Date();
         yesterday.setDate(yesterday.getDate() - 1);
         const yesterdayDate = yesterday.toISOString().split('T')[0];
@@ -367,7 +369,7 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         });
  
         if (activeNightShift) {
-            console.log(`⚠️ Active night shift found for ${name} on ${yesterdayDate}, blocking morning clock-in`);
+            console.log(`⚠️ Active night shift found for ${name} on ${yesterdayDate}, blocking clock-in`);
             return res.json({
                 success: false,
                 message: "Active night shift still open. Please clock out first.",
@@ -376,6 +378,47 @@ app.post('/api/attendance/clock-in', async (req, res) => {
                     clock_in_time: activeNightShift.clock_in_time
                 }
             });
+        }
+        
+        // ===== CHECK 2: Recently completed night shift (ended today) =====
+        // This prevents clocking in for morning shift right after night shift ends
+        if (!isNightShiftClockIn) {
+            // This is a morning shift clock-in - check if night shift ended today
+            const today = date;
+            
+            // Find night shifts that ended today (either manual or auto)
+            const recentNightShifts = await db.collection('attendance_records').find({
+                name: name,
+                shift_type: "night",
+                clock_out_time: { $ne: null, $ne: "" },
+                $or: [
+                    { clock_out_date: today },
+                    { auto_clock_out_date: today }
+                ]
+            }).sort({ clock_out_time: -1 }).limit(1).toArray();
+            
+            if (recentNightShifts.length > 0) {
+                const nightShift = recentNightShifts[0];
+                const clockOutTime = nightShift.clock_out_time;
+                const clockOutDate = nightShift.clock_out_date || nightShift.auto_clock_out_date;
+                
+                console.log(`⚠️ Found night shift that ended today at ${clockOutTime} on ${clockOutDate}`);
+                
+                // Parse clock-out hour
+                const clockOutHour = parseInt(clockOutTime.split(':')[0]);
+                
+                // If night shift ended after 6:00 AM, block morning shift
+                if (clockOutHour >= 6) {
+                    console.log(`⚠️ Night shift ended at ${clockOutTime} - too late for morning shift`);
+                    return res.json({
+                        success: false,
+                        message: `Cannot clock in for morning shift. Your night shift ended at ${clockOutTime}. You can only clock in for night shift after 10:00 PM.`,
+                        night_shift_end_time: clockOutTime,
+                        night_shift_end_date: clockOutDate,
+                        next_allowed_clock_in: "10:00 PM"
+                    });
+                }
+            }
         }
         
         // ===== LATE DETECTION =====
