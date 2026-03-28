@@ -324,7 +324,7 @@ app.get('/api/employees/:id', async (req, res) => {
 
 // ========== ATTENDANCE ENDPOINTS ==========
 
-// Clock in (UPDATED with proper late detection)
+// Clock in (UPDATED with proper late detection + active night shift guard)
 app.post('/api/attendance/clock-in', async (req, res) => {
     try {
         if (!isConnected) {
@@ -349,6 +349,32 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             return res.json({ 
                 success: false, 
                 message: "Already clocked in today" 
+            });
+        }
+ 
+        // FIX: Check for an active (unfinished) night shift record from yesterday
+        // This prevents a night shift employee from clocking in for morning
+        // after their date rolls over past nightShiftEnd (06:00)
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const yesterdayDate = yesterday.toISOString().split('T')[0];
+ 
+        const activeNightShift = await db.collection('attendance_records').findOne({
+            name: name,
+            date: yesterdayDate,
+            shift_type: "night",
+            clock_out_time: { $exists: false }
+        });
+ 
+        if (activeNightShift) {
+            console.log(`⚠️ Active night shift found for ${name} on ${yesterdayDate}, blocking morning clock-in`);
+            return res.json({
+                success: false,
+                message: "Active night shift still open. Please clock out first.",
+                active_night_shift: {
+                    date: yesterdayDate,
+                    clock_in_time: activeNightShift.clock_in_time
+                }
             });
         }
         
@@ -946,6 +972,28 @@ app.post('/api/sync/attendance', async (req, res) => {
                 });
                 
                 if (!existing) {
+                    // FIX: Check for active night shift from yesterday before inserting
+                    const syncYesterday = new Date(record.date);
+                    syncYesterday.setDate(syncYesterday.getDate() - 1);
+                    const syncYesterdayDate = syncYesterday.toISOString().split('T')[0];
+ 
+                    const activeNightShift = await db.collection('attendance_records').findOne({
+                        name: record.name,
+                        date: syncYesterdayDate,
+                        shift_type: "night",
+                        clock_out_time: { $exists: false }
+                    });
+ 
+                    if (activeNightShift) {
+                        console.log(`⚠️ Sync blocked for ${record.name}: active night shift on ${syncYesterdayDate}`);
+                        results.push({ 
+                            id: record.local_id, 
+                            success: false, 
+                            message: "Active night shift still open. Please clock out first." 
+                        });
+                        continue;
+                    }
+ 
                     const result = await db.collection('attendance_records').insertOne({
                         name: record.name,
                         clock_in_time: record.clock_in_time,
