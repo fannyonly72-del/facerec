@@ -334,7 +334,7 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             });
         }
         
-        const { name, clock_in_time, date } = req.body;
+        const { name, clock_in_time, date, face_image_base64 } = req.body;
         
         console.log(`⏰ Clock-in: ${name} at ${clock_in_time} on ${date}`);
         
@@ -479,7 +479,11 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             sync_status: "synced",
             late_status: isLate ? "late" : "on_time",
             late_minutes: isLate ? Math.ceil(lateMinutes) : 0,
-            shift_type: shiftType.toLowerCase()
+            shift_type: shiftType.toLowerCase(),
+            clock_in_face_image: face_image_base64 || null,
+            clock_in_verified: !!face_image_base64,
+            clock_in_captured_at: new Date(),
+            manually_verified: false
         };
         
         const result = await db.collection('attendance_records').insertOne(record);
@@ -540,7 +544,7 @@ app.post('/api/attendance/clock-out', async (req, res) => {
             });
         }
         
-        const { name, clock_out_time, date, clock_out_date } = req.body;
+        const { name, clock_out_time, date, clock_out_date, face_image_base64 } = req.body;
         
         console.log(`⏰ Clock-out: ${name} at ${clock_out_time}`);
         console.log(`📅 Clock-out date: ${clock_out_date || date}`);
@@ -552,7 +556,10 @@ app.post('/api/attendance/clock-out', async (req, res) => {
             { 
                 $set: { 
                     clock_out_time: clock_out_time,
-                    clock_out_date: finalClockOutDate 
+                    clock_out_date: finalClockOutDate,
+                    clock_out_face_image: face_image_base64 || null,
+                    clock_out_verified: !!face_image_base64,
+                    clock_out_captured_at: new Date()
                 } 
             }
         );
@@ -1051,7 +1058,11 @@ app.post('/api/sync/attendance', async (req, res) => {
                         clock_in_time: record.clock_in_time,
                         date: record.date,
                         timestamp: new Date(),
-                        sync_status: "synced"
+                        sync_status: "synced",
+                        clock_in_face_image: record.face_image_base64 || null,
+                        clock_in_verified: !!record.face_image_base64,
+                        clock_in_captured_at: new Date(),
+                        manually_verified: false
                     });
                     results.push({ 
                         id: record.local_id, 
@@ -1069,6 +1080,13 @@ app.post('/api/sync/attendance', async (req, res) => {
                 if (record.clock_out_date) {
                     updateData.clock_out_date = record.clock_out_date;
                     console.log(`📅 Syncing clock_out_date: ${record.clock_out_date}`);
+                }
+                
+                // NEW: Face image
+                if (record.face_image_base64) {
+                    updateData.clock_out_face_image = record.face_image_base64;
+                    updateData.clock_out_verified = true;
+                    updateData.clock_out_captured_at = new Date();
                 }
                 
                 const result = await db.collection('attendance_records').updateOne(
