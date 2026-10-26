@@ -12,7 +12,8 @@ app.use(express.json({ limit: '10mb' })); // Increase limit to 10MB
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // MongoDB connection
-const uri = "mongodb+srv://hiraiginjialt4_db_user:l2CDwnX4pQdcEvI7@cluster0.sjtehir.mongodb.net/attendance_system?retryWrites=true&w=majority";
+const uri = process.env.MONGODB_URI;
+if (!uri) throw new Error('MONGODB_URI environment variable is required');
 const client = new MongoClient(uri);
 
 let db;
@@ -115,7 +116,7 @@ async function getEmployeeDepartment(employeeName) {
 }
 
 // Create late violation (UPDATED with correct schema and employeeId lookup)
-async function createLateViolation(employeeName, clockInTime, attendanceDate, shiftType, gracePeriodMinutes, lateMinutes) {
+async function createLateViolation(employeeName, employeeIdValue, clockInTime, attendanceDate, shiftType, gracePeriodMinutes, lateMinutes) {
     try {
         if (!isConnected) {
             console.log("⚠️ MongoDB not connected, cannot create violation");
@@ -125,27 +126,27 @@ async function createLateViolation(employeeName, clockInTime, attendanceDate, sh
         console.log(`\n📝 Creating violation for: ${employeeName}`);
         
         // STEP 1: Get employeeId from attendance_system.employee_faces
-        let employeeId = null;
+        let employeeId = employeeIdValue || null;
         let department = "Unknown";
         
         try {
             // Look up employee by name in attendance_system.employee_faces
-            const employee = await db.collection('employee_faces').findOne({ 
-                name: employeeName 
-            });
+            const employee = employeeId
+                ? await db.collection('employee_faces').findOne({ employee_id: employeeId })
+                : await db.collection('employee_faces').findOne({ name: employeeName });
             
             if (employee) {
-                employeeId = employee.employee_id;
+                employeeId = employee.employee_id || employeeId;
                 department = employee.department || "Unknown";
                 console.log(`   Found employee ID: ${employeeId}`);
                 console.log(`   Department: ${department}`);
             } else {
                 console.log(`   ⚠️ Employee not found in employee_faces for name: ${employeeName}`);
-                employeeId = `UNKNOWN_${employeeName.replace(/\s/g, '_')}`;
+                employeeId = employeeId || `UNKNOWN_${employeeName.replace(/\s/g, '_')}`;
             }
         } catch (error) {
             console.error(`   Error looking up employee: ${error.message}`);
-            employeeId = `UNKNOWN_${employeeName.replace(/\s/g, '_')}`;
+            employeeId = employeeId || `UNKNOWN_${employeeName.replace(/\s/g, '_')}`;
         }
         
         // STEP 2: Calculate late minutes rounded up
@@ -334,7 +335,7 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             });
         }
         
-        const { name, clock_in_time, date, face_image_base64 } = req.body;
+        const { local_id, employee_id, name, clock_in_time, date, face_image_base64 } = req.body;
         
         console.log(`⏰ Clock-in: ${name} at ${clock_in_time} on ${date}`);
         
@@ -343,29 +344,42 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         const isNightShiftClockIn = (clockInHour >= 22 || clockInHour <= 6);
         
         // Check if already clocked in today
-        const existing = await db.collection('attendance_records').findOne({
-            name: name,
-            date: date
-        });
+        const clientRecordId = local_id ? `${employee_id}:${local_id}` : null;
+        const existing = clientRecordId
+            ? await db.collection('attendance_records').findOne({ $or: [
+                { client_record_id: clientRecordId }, { employee_id, date }, { name, date }
+            ] })
+            : await db.collection('attendance_records').findOne({ employee_id, date });
         
         if (existing) {
             console.log(`⚠️ Already clocked in today: ${name}`);
+            if (clientRecordId && !existing.client_record_id) {
+                await db.collection('attendance_records').updateOne(
+                    { _id: existing._id },
+                    { $set: { employee_id, client_record_id: clientRecordId } }
+                );
+            }
             return res.json({ 
-                success: false, 
-                message: "Already clocked in today" 
+                success: true,
+                message: "Clock-in already recorded",
+                record_id: existing._id
             });
         }
  
         // ===== CHECK 1: Active night shift (not clocked out) =====
-        const yesterday = new Date();
+        const yesterday = new Date(`${date}T00:00:00.000Z`);
         yesterday.setDate(yesterday.getDate() - 1);
         const yesterdayDate = yesterday.toISOString().split('T')[0];
  
         const activeNightShift = await db.collection('attendance_records').findOne({
-            name: name,
+            $or: [{ employee_id }, { name }],
             date: yesterdayDate,
             shift_type: "night",
-            clock_out_time: { $exists: false }
+            $and: [{ $or: [
+                { clock_out_time: { $exists: false } },
+                { clock_out_time: null },
+                { clock_out_time: '' }
+            ] }]
         });
  
         if (activeNightShift) {
@@ -388,13 +402,15 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             
             // Find night shifts that ended today (either manual or auto)
             const recentNightShifts = await db.collection('attendance_records').find({
-                name: name,
+                $and: [
+                    { $or: [{ employee_id }, { name }] },
+                    { $or: [
+                        { clock_out_date: today },
+                        { auto_clock_out_date: today }
+                    ] }
+                ],
                 shift_type: "night",
-                clock_out_time: { $ne: null, $ne: "" },
-                $or: [
-                    { clock_out_date: today },
-                    { auto_clock_out_date: today }
-                ]
+                clock_out_time: { $nin: [null, ""] }
             }).sort({ clock_out_time: -1 }).limit(1).toArray();
             
             if (recentNightShifts.length > 0) {
@@ -472,7 +488,9 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         
         // Create attendance record with late status
         const record = {
+            employee_id,
             name: name,
+            client_record_id: clientRecordId,
             clock_in_time: clock_in_time,
             date: date,
             timestamp: new Date(),
@@ -494,6 +512,7 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         if (isLate) {
             violationId = await createLateViolation(
                 name,           // employeeName
+                employee_id,    // stable employee identity
                 clock_in_time,  // clockInTime
                 date,           // attendanceDate
                 shiftType,      // shiftType
@@ -544,17 +563,28 @@ app.post('/api/attendance/clock-out', async (req, res) => {
             });
         }
         
-        const { name, clock_out_time, date, clock_out_date, face_image_base64 } = req.body;
+        const { local_id, employee_id, name, clock_out_time, date, clock_out_date, face_image_base64 } = req.body;
         
         console.log(`⏰ Clock-out: ${name} at ${clock_out_time}`);
         console.log(`📅 Clock-out date: ${clock_out_date || date}`);
         
         const finalClockOutDate = clock_out_date || date;
         
+        const clientRecordId = local_id ? `${employee_id}:${local_id}` : null;
+        const filter = clientRecordId
+            ? { client_record_id: clientRecordId }
+            : { employee_id, date, $or: [
+                { clock_out_time: { $exists: false } },
+                { clock_out_time: null },
+                { clock_out_time: '' }
+            ] };
         const result = await db.collection('attendance_records').updateOne(
-            { name: name, date: date },
+            filter,
             { 
                 $set: { 
+                    employee_id,
+                    name,
+                    ...(clientRecordId ? { client_record_id: clientRecordId } : {}),
                     clock_out_time: clock_out_time,
                     clock_out_date: finalClockOutDate,
                     clock_out_face_image: face_image_base64 || null,
@@ -564,11 +594,15 @@ app.post('/api/attendance/clock-out', async (req, res) => {
             }
         );
         
-        if (result.modifiedCount > 0) {
+        if (result.matchedCount > 0) {
+            const saved = await db.collection('attendance_records').findOne(filter, {
+                projection: { _id: 1 }
+            });
             console.log(`✅ Clock-out recorded for ${name} on ${finalClockOutDate}`);
             res.json({ 
                 success: true, 
                 message: "Clocked out successfully",
+                record_id: result.upsertedId || saved?._id,
                 clock_out_date: finalClockOutDate
             });
         } else {
@@ -904,6 +938,7 @@ app.post('/api/attendance/check-late-violations', async (req, res) => {
                     if (!existingViolation) {
                         const violationId = await createLateViolation(
                             employeeName,
+                            record.employee_id,
                             clockInTime,
                             attendanceDate,
                             shiftType,
@@ -1021,82 +1056,53 @@ app.post('/api/sync/attendance', async (req, res) => {
         console.log(`🔄 Syncing ${pending_records.length} pending records`);
         
         const results = [];
-        
-        for (const record of pending_records) {
-            if (!record.clock_out_time) {
-                // Clock-in record
-                const existing = await db.collection('attendance_records').findOne({
+        for (const record of pending_records || []) {
+            try {
+                const clientRecordId = record.local_id && record.employee_id
+                    ? `${record.employee_id}:${record.local_id}` : null;
+                const filter = clientRecordId
+                    ? { $or: [
+                        { client_record_id: clientRecordId },
+                        { employee_id: record.employee_id, date: record.date },
+                        { name: record.name, date: record.date }
+                    ] }
+                    : { $or: [
+                        { employee_id: record.employee_id, date: record.date },
+                        { name: record.name, date: record.date }
+                    ] };
+                const set = {
+                    employee_id: record.employee_id,
                     name: record.name,
-                    date: record.date
-                });
-                
-                if (!existing) {
-                    // FIX: Check for active night shift from yesterday before inserting
-                    const syncYesterday = new Date(record.date);
-                    syncYesterday.setDate(syncYesterday.getDate() - 1);
-                    const syncYesterdayDate = syncYesterday.toISOString().split('T')[0];
- 
-                    const activeNightShift = await db.collection('attendance_records').findOne({
-                        name: record.name,
-                        date: syncYesterdayDate,
-                        shift_type: "night",
-                        clock_out_time: { $exists: false }
-                    });
- 
-                    if (activeNightShift) {
-                        console.log(`⚠️ Sync blocked for ${record.name}: active night shift on ${syncYesterdayDate}`);
-                        results.push({ 
-                            id: record.local_id, 
-                            success: false, 
-                            message: "Active night shift still open. Please clock out first." 
-                        });
-                        continue;
-                    }
- 
-                    const result = await db.collection('attendance_records').insertOne({
-                        name: record.name,
-                        clock_in_time: record.clock_in_time,
-                        date: record.date,
-                        timestamp: new Date(),
-                        sync_status: "synced",
-                        clock_in_face_image: record.face_image_base64 || null,
-                        clock_in_verified: !!record.face_image_base64,
-                        clock_in_captured_at: new Date(),
-                        manually_verified: false
-                    });
-                    results.push({ 
-                        id: record.local_id, 
-                        success: true, 
-                        mongo_id: result.insertedId 
-                    });
-                }
-            } else {
-                // Clock-out record - UPDATED to include clock_out_date
-                const updateData = { 
-                    clock_out_time: record.clock_out_time 
+                    date: record.date,
+                    clock_in_time: record.clock_in_time,
+                    timestamp: new Date(),
+                    sync_status: "synced",
+                    manually_verified: false
                 };
-                
-                // Add clock_out_date if present in the record
-                if (record.clock_out_date) {
-                    updateData.clock_out_date = record.clock_out_date;
-                    console.log(`📅 Syncing clock_out_date: ${record.clock_out_date}`);
-                }
-                
-                // NEW: Face image
+                if (clientRecordId) set.client_record_id = clientRecordId;
                 if (record.face_image_base64) {
-                    updateData.clock_out_face_image = record.face_image_base64;
-                    updateData.clock_out_verified = true;
-                    updateData.clock_out_captured_at = new Date();
+                    set.clock_in_face_image = record.face_image_base64;
+                    set.clock_in_verified = true;
+                    set.clock_in_captured_at = new Date();
                 }
-                
+                if (record.clock_out_time) {
+                    set.clock_out_time = record.clock_out_time;
+                    set.clock_out_date = record.clock_out_date || record.date;
+                    if (record.face_image_base64) {
+                        set.clock_out_face_image = record.face_image_base64;
+                        set.clock_out_verified = true;
+                        set.clock_out_captured_at = new Date();
+                    }
+                }
                 const result = await db.collection('attendance_records').updateOne(
-                    { name: record.name, date: record.date },
-                    { $set: updateData }
+                    filter, { $set: set }, { upsert: true }
                 );
-                results.push({ 
-                    id: record.local_id, 
-                    success: result.modifiedCount > 0 
-                });
+                const saved = result.upsertedId
+                    ? { _id: result.upsertedId }
+                    : await db.collection('attendance_records').findOne(filter, { projection: { _id: 1 } });
+                results.push({ id: record.local_id, success: !!saved, mongo_id: saved?._id });
+            } catch (recordError) {
+                results.push({ id: record.local_id, success: false, message: recordError.message });
             }
         }
         
