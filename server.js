@@ -25,6 +25,12 @@ async function connectDB() {
         await client.connect();
         db = client.db("attendance_system");
         isConnected = true;
+        await db.collection('face_verification_images').createIndex(
+            { record_id: 1, event_type: 1 }, { unique: true }
+        );
+        await db.collection('face_verification_images').createIndex(
+            { expires_at: 1 }, { expireAfterSeconds: 0 }
+        );
         console.log("✅ Connected to MongoDB Atlas");
         console.log("📁 Database: attendance_system");
         
@@ -39,6 +45,31 @@ async function connectDB() {
 }
 
 connectDB();
+
+async function storeAttendanceFaceImage(recordId, eventType, imageBase64, details = {}) {
+    if (!recordId || !imageBase64) return;
+    const capturedAt = details.capturedAt instanceof Date ? details.capturedAt : new Date();
+    const setting = await db.collection('face_verification_settings').findOne({ _id: 'retention' });
+    const retentionDays = Number.isInteger(Number(setting?.retention_days))
+        ? Number(setting.retention_days) : 90;
+    const image = {
+        record_id: String(recordId),
+        source_collection: 'attendance_records',
+        event_type: eventType,
+        employee_id: details.employeeId || null,
+        name: details.name || null,
+        date: details.date || null,
+        image_base64: imageBase64,
+        captured_at: capturedAt,
+        created_at: new Date()
+    };
+    if (retentionDays > 0) {
+        image.expires_at = new Date(capturedAt.getTime() + retentionDays * 24 * 60 * 60 * 1000);
+    }
+    await db.collection('face_verification_images').replaceOne(
+        { record_id: image.record_id, event_type: eventType }, image, { upsert: true }
+    );
+}
 
 // ========== HELPER FUNCTIONS FOR LATE DETECTION ==========
 
@@ -515,13 +546,17 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             late_status: isLate ? "late" : "on_time",
             late_minutes: isLate ? Math.ceil(lateMinutes) : 0,
             shift_type: shiftType.toLowerCase(),
-            clock_in_face_image: face_image_base64 || null,
             clock_in_verified: !!face_image_base64,
             clock_in_captured_at: new Date(),
             manually_verified: false
         };
         
         const result = await db.collection('attendance_records').insertOne(record);
+        if (face_image_base64) {
+            await storeAttendanceFaceImage(result.insertedId, 'clock_in', face_image_base64, {
+                employeeId: employee_id, name, date, capturedAt: record.clock_in_captured_at
+            });
+        }
         
         console.log(`✅ Clock-in recorded: ${name}`);
         
@@ -595,8 +630,18 @@ app.post('/api/attendance/clock-out', async (req, res) => {
                 { clock_out_time: null },
                 { clock_out_time: '' }
             ] };
+        const openRecord = await db.collection('attendance_records').findOne(filter, {
+            projection: { _id: 1 }
+        });
+        if (!openRecord) {
+            console.log(`⚠️ No clock-in record found for ${name} on ${date}`);
+            return res.json({
+                success: false,
+                message: "No clock-in record found"
+            });
+        }
         const result = await db.collection('attendance_records').updateOne(
-            filter,
+            { _id: openRecord._id },
             { 
                 $set: { 
                     employee_id,
@@ -604,7 +649,6 @@ app.post('/api/attendance/clock-out', async (req, res) => {
                     ...(clientRecordId ? { client_record_id: clientRecordId } : {}),
                     clock_out_time: clock_out_time,
                     clock_out_date: finalClockOutDate,
-                    clock_out_face_image: face_image_base64 || null,
                     clock_out_verified: !!face_image_base64,
                     clock_out_captured_at: new Date()
                 } 
@@ -612,14 +656,16 @@ app.post('/api/attendance/clock-out', async (req, res) => {
         );
         
         if (result.matchedCount > 0) {
-            const saved = await db.collection('attendance_records').findOne(filter, {
-                projection: { _id: 1 }
-            });
+            if (face_image_base64) {
+                await storeAttendanceFaceImage(openRecord._id, 'clock_out', face_image_base64, {
+                    employeeId: employee_id, name, date: finalClockOutDate
+                });
+            }
             console.log(`✅ Clock-out recorded for ${name} on ${finalClockOutDate}`);
             res.json({ 
                 success: true, 
                 message: "Clocked out successfully",
-                record_id: result.upsertedId || saved?._id,
+                record_id: openRecord._id,
                 clock_out_date: finalClockOutDate
             });
         } else {
@@ -1098,7 +1144,6 @@ app.post('/api/sync/attendance', async (req, res) => {
                 };
                 if (clientRecordId) set.client_record_id = clientRecordId;
                 if (record.face_image_base64) {
-                    set.clock_in_face_image = record.face_image_base64;
                     set.clock_in_verified = true;
                     set.clock_in_captured_at = new Date();
                 }
@@ -1106,7 +1151,6 @@ app.post('/api/sync/attendance', async (req, res) => {
                     set.clock_out_time = record.clock_out_time;
                     set.clock_out_date = record.clock_out_date || record.date;
                     if (record.face_image_base64) {
-                        set.clock_out_face_image = record.face_image_base64;
                         set.clock_out_verified = true;
                         set.clock_out_captured_at = new Date();
                     }
@@ -1117,6 +1161,19 @@ app.post('/api/sync/attendance', async (req, res) => {
                 const saved = result.upsertedId
                     ? { _id: result.upsertedId }
                     : await db.collection('attendance_records').findOne(filter, { projection: { _id: 1 } });
+                if (saved?._id && record.face_image_base64) {
+                    await storeAttendanceFaceImage(saved._id, 'clock_in', record.face_image_base64, {
+                        employeeId: record.employee_id, name: record.name, date: record.date,
+                        capturedAt: set.clock_in_captured_at
+                    });
+                    if (record.clock_out_time) {
+                        await storeAttendanceFaceImage(saved._id, 'clock_out', record.face_image_base64, {
+                            employeeId: record.employee_id, name: record.name,
+                            date: record.clock_out_date || record.date,
+                            capturedAt: set.clock_out_captured_at
+                        });
+                    }
+                }
                 results.push({ id: record.local_id, success: !!saved, mongo_id: saved?._id });
             } catch (recordError) {
                 results.push({ id: record.local_id, success: false, message: recordError.message });
