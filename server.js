@@ -1,5 +1,5 @@
 const express = require('express');
-const { MongoClient } = require('mongodb');
+const { MongoClient, GridFSBucket, ObjectId } = require('mongodb');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -304,6 +304,23 @@ app.get('/api/employees/:id', async (req, res) => {
             .findOne({ employee_id: req.params.id });
         
         if (employee) {
+            // Employee face photos are now stored in the private employee_images
+            // GridFS bucket. Keep the Android sync API response compatible by
+            // materializing only this selected employee's face as base64.
+            if (!employee.face_image_base64 && employee.face_image_file_id) {
+                const fileId = employee.face_image_file_id instanceof ObjectId
+                    ? employee.face_image_file_id
+                    : new ObjectId(String(employee.face_image_file_id));
+                const bucket = new GridFSBucket(db, { bucketName: 'employee_images' });
+                const chunks = [];
+                await new Promise((resolve, reject) => {
+                    const download = bucket.openDownloadStream(fileId);
+                    download.on('data', chunk => chunks.push(chunk));
+                    download.on('error', reject);
+                    download.on('end', resolve);
+                });
+                employee.face_image_base64 = Buffer.concat(chunks).toString('base64');
+            }
             res.json({ 
                 success: true, 
                 employee 
