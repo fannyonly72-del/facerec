@@ -82,6 +82,158 @@ function timeToMinutes(timeStr) {
     return (hours * 60) + minutes + (seconds / 60);
 }
 
+// ===== LATE TIER ENGINE START =====
+// Decides whether a clock-in is "late" and which tier it belongs to, using the
+// "Deduction (min)" value of each tier on the Late Deduction settings screen.
+//
+// Source of truth (MongoDB, database "attendance_system"):
+//   late_deduction_settings   -> one document: morning/night { work_start, grace_minutes?, thresholds[] }
+//   attendance_settings       -> one document: clock_in_start, night_shift_start, night_shift_end,
+//                                grace_period_minutes
+// Each threshold is { from_minutes, to_minutes, deduction_minutes, description }.
+//
+// RULE (From/To are NOT used, only deduction_minutes):
+//   minutes_late = clock-in time - work start              (e.g. 08:31 - 08:00 = 31)
+//   A tier applies once minutes_late is MORE than its deduction_minutes.
+//   The tier with the highest deduction_minutes that applies wins.
+//   deduction_minutes = 0 is the grace tier (no violation).
+//   Violation = the winning tier has deduction_minutes > 0.
+//
+//   With tiers 0 / 30 / 60 and work start 08:00:
+//     08:00 - 08:30  -> grace, no violation
+//     08:31 - 09:00  -> "Minor late (30 min)"
+//     09:01 and later -> "Major late (1 hour)"
+
+const DEFAULT_LATE_TIERS = [
+    { from_minutes: 0, to_minutes: 15, deduction_minutes: 0, description: "Grace period" },
+    { from_minutes: 15, to_minutes: 30, deduction_minutes: 30, description: "Minor late (30 min)" },
+    { from_minutes: 30, to_minutes: 999, deduction_minutes: 60, description: "Major late (1 hour)" }
+];
+
+const DEFAULT_LATE_SETTINGS = {
+    enabled: true,
+    deduction_rule: "tiered",
+    morning: { work_start: "08:00", thresholds: DEFAULT_LATE_TIERS },
+    night: { work_start: "22:00", grace_minutes: 15, thresholds: DEFAULT_LATE_TIERS }
+};
+
+// "08:31", "08:31:45" or an ISO string -> whole minutes since midnight (seconds ignored, like payroll)
+function hhmmToMinutes(value) {
+    if (!value) return null;
+    const parts = String(value).split('T').pop().split(':');
+    const hours = parseInt(parts[0], 10);
+    const minutes = parseInt(parts[1], 10);
+    if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+    return hours * 60 + minutes;
+}
+
+function minutesToHHMM(totalMinutes) {
+    const wrapped = ((Math.round(totalMinutes) % 1440) + 1440) % 1440;
+    const h = String(Math.floor(wrapped / 60)).padStart(2, '0');
+    const m = String(wrapped % 60).padStart(2, '0');
+    return `${h}:${m}`;
+}
+
+// Night shift = clock-in from 10:00 PM up to 6:00 AM (unchanged from the previous behaviour)
+function isNightClockIn(clockInTime) {
+    const minutes = hhmmToMinutes(clockInTime);
+    if (minutes === null) return false;
+    return minutes >= (22 * 60) || minutes <= (6 * 60);
+}
+
+async function getLateDeductionSettings() {
+    try {
+        if (!isConnected) return DEFAULT_LATE_SETTINGS;
+        const settings = await db.collection('late_deduction_settings').findOne({});
+        return settings || DEFAULT_LATE_SETTINGS;
+    } catch (error) {
+        console.error("Error getting late deduction settings:", error);
+        return DEFAULT_LATE_SETTINGS;
+    }
+}
+
+// Pure function (no DB access) so it can be unit-tested.
+function evaluateLateness(clockInTime, isNight, lateSettings, attendanceSettings) {
+    const result = {
+        isLate: false,
+        minutesLate: 0,          // minutes after the work start
+        tierLabel: null,
+        deductionMinutes: 0,
+        severity: null,
+        workStart: null,
+        graceMinutes: 0,
+        cutoffTime: null         // same as workStart (kept for response compatibility)
+    };
+
+    const clockIn = hhmmToMinutes(clockInTime);
+    if (clockIn === null) return result;
+
+    const late = lateSettings || DEFAULT_LATE_SETTINGS;
+    const attendance = attendanceSettings || {};
+    const shiftConfig = (isNight ? late.night : late.morning) || {};
+
+    // Work start: attendance_settings first, then the late-settings screen, then 08:00 / 22:00
+    let workStart = hhmmToMinutes(isNight ? attendance.night_shift_start : attendance.clock_in_start);
+    if (workStart === null) workStart = hhmmToMinutes(shiftConfig.work_start);
+    if (workStart === null) workStart = isNight ? 22 * 60 : 8 * 60;
+
+    // Night shift: a clock-in after midnight belongs to the shift that started the evening before
+    let adjustedClockIn = clockIn;
+    const nightStart = hhmmToMinutes(attendance.night_shift_start || "22:00");
+    const nightEnd = hhmmToMinutes(attendance.night_shift_end || "06:00");
+    if (isNight && nightStart !== null && nightEnd !== null && nightStart > nightEnd && clockIn < nightEnd) {
+        adjustedClockIn += 24 * 60;
+    }
+
+    const minutesLate = adjustedClockIn - workStart; // minutes after the work start
+    result.workStart = minutesToHHMM(workStart);
+    result.cutoffTime = result.workStart;
+    if (minutesLate <= 0) return result; // on time
+    result.minutesLate = minutesLate;
+
+    // Flat / percentage rules (or deductions turned off) have no tiers: use the plain grace period
+    if (late.enabled === false || (late.deduction_rule && late.deduction_rule !== "tiered")) {
+        const graceRaw = shiftConfig.grace_minutes !== undefined && shiftConfig.grace_minutes !== null
+            ? shiftConfig.grace_minutes
+            : (attendance.grace_period_minutes !== undefined && attendance.grace_period_minutes !== null
+                ? attendance.grace_period_minutes : 15);
+        result.graceMinutes = Math.max(0, parseInt(graceRaw, 10) || 0);
+        if (minutesLate <= result.graceMinutes) return result;
+        result.isLate = true;
+        result.tierLabel = "Late";
+        result.severity = "Medium";
+        return result;
+    }
+
+    const tiers = (Array.isArray(shiftConfig.thresholds) && shiftConfig.thresholds.length > 0)
+        ? shiftConfig.thresholds : DEFAULT_LATE_TIERS;
+
+    // Order tiers by their Deduction (min); the highest one that minutes_late has passed wins
+    const ordered = tiers
+        .map(tier => ({ tier, deduction: Math.max(0, Number(tier.deduction_minutes) || 0) }))
+        .sort((a, b) => a.deduction - b.deduction);
+
+    let matched = null;
+    for (const entry of ordered) {
+        if (minutesLate > entry.deduction) matched = entry;
+    }
+    if (!matched) return result;
+
+    result.tierLabel = matched.tier.description || `Late (${matched.deduction} min deduction)`;
+    result.deductionMinutes = matched.deduction;
+    if (matched.deduction > 0) {
+        result.isLate = true; // a tier that deducts pay = a violation
+        const paid = ordered.filter(entry => entry.deduction > 0);
+        const rank = paid.indexOf(matched);
+        if (paid.length === 1) result.severity = "Medium";
+        else if (rank === 0) result.severity = "Low";
+        else if (rank === paid.length - 1) result.severity = "High";
+        else result.severity = "Medium";
+    }
+    return result; // grace tier (0 deduction) => not late, no violation
+}
+// ===== LATE TIER ENGINE END =====
+
 // Get attendance settings from database
 async function getAttendanceSettings() {
     try {
@@ -146,8 +298,14 @@ async function getEmployeeDepartment(employeeName) {
     }
 }
 
-// Create late violation (UPDATED with correct schema and employeeId lookup)
-async function createLateViolation(employeeName, employeeIdValue, clockInTime, attendanceDate, shiftType, gracePeriodMinutes, lateMinutes) {
+// Violations live in a different database than the attendance data:
+//   database: ems_violations, collection: employee_violations
+function violationsCollection() {
+    return client.db("ems_violations").collection("employee_violations");
+}
+
+// Create late violation based on the payroll deduction tier (lateInfo comes from evaluateLateness)
+async function createLateViolation(employeeName, employeeIdValue, clockInTime, attendanceDate, shiftType, lateInfo) {
     try {
         if (!isConnected) {
             console.log("⚠️ MongoDB not connected, cannot create violation");
@@ -180,25 +338,17 @@ async function createLateViolation(employeeName, employeeIdValue, clockInTime, a
             employeeId = employeeId || `UNKNOWN_${employeeName.replace(/\s/g, '_')}`;
         }
         
-        // STEP 2: Calculate late minutes rounded up
-        const lateMinutesRounded = Math.ceil(lateMinutes);
-        
-        // STEP 3: Create description based on shift type
-        let description = "";
-        if (shiftType === "Morning") {
-            description = `Morning shift late: Clocked in at ${clockInTime} (${lateMinutesRounded} minute${lateMinutesRounded !== 1 ? 's' : ''} after ${gracePeriodMinutes}-minute grace period)`;
-        } else if (shiftType === "Night") {
-            description = `Night shift late: Clocked in at ${clockInTime} (${lateMinutesRounded} minute${lateMinutesRounded !== 1 ? 's' : ''} after 1:00 AM)`;
-        } else {
-            description = `Late: Clocked in at ${clockInTime} (${lateMinutesRounded} minute${lateMinutesRounded !== 1 ? 's' : ''} late)`;
+        // STEP 2: Build the description from the matched tier
+        const minutesLate = lateInfo.minutesLate;
+        const tierLabel = lateInfo.tierLabel || "Late";
+        let description = `${tierLabel}: ${shiftType} shift - clocked in at ${clockInTime}, ` +
+            `${minutesLate} minute${minutesLate !== 1 ? 's' : ''} after the ${lateInfo.workStart} work start.`;
+        if (lateInfo.deductionMinutes > 0) {
+            description += ` Payroll deduction: ${lateInfo.deductionMinutes} minutes.`;
         }
         
-        // STEP 4: Use ems_violations database
-        const violationsDb = client.db("ems_violations");
-        const violationsCollection = violationsDb.collection("employee_violations");
-        
-        // STEP 5: Check if violation already exists for this employee on this date
-        const existingViolation = await violationsCollection.findOne({
+        // STEP 3: Check if violation already exists for this employee on this date
+        const existingViolation = await violationsCollection().findOne({
             employeeId: employeeId,
             date: attendanceDate,
             violationType: "Tardiness"
@@ -209,29 +359,35 @@ async function createLateViolation(employeeName, employeeIdValue, clockInTime, a
             return null;
         }
         
-        // STEP 6: Create violation document with correct schema
+        // STEP 4: Create violation document
         const violation = {
-            employeeId: employeeId,           // e.g., "GREMP004"
+            employeeId: employeeId,            // e.g., "GREMP004"
             employeeName: employeeName,        // e.g., "Jan Mark F. Selge"
             department: department,            // e.g., "Graphics"
-            violationType: "Tardiness",        // Fixed value
-            description: description,          // Generated description
+            violationType: "Tardiness",        // Fixed value (the Violations page filters on this)
+            description: description,          // e.g., "Minor late (30 min): Morning shift - clocked in at ..."
             status: "Pending",                 // Default status
-            severity: "High",                  // Set to High for tardiness
+            severity: lateInfo.severity || "Medium", // Low = lowest deducting tier ... High = highest tier
             createdAt: new Date(),             // Current timestamp
-            source: "auto_late_detection"      // Source of creation
+            source: "auto_late_detection",     // Source of creation
+            date: attendanceDate,              // Attendance date (used for de-duplication)
+            lateTier: tierLabel,               // e.g., "Minor late (30 min)" / "Major late (1 hour)"
+            lateMinutes: minutesLate,          // Minutes after the work start
+            deductionMinutes: lateInfo.deductionMinutes, // Deduction (min) of the matched tier
+            shiftType: shiftType               // "Morning" | "Night"
         };
         
         console.log(`📤 Inserting violation:`);
         console.log(`   employeeId: ${violation.employeeId}`);
         console.log(`   employeeName: ${violation.employeeName}`);
         console.log(`   department: ${violation.department}`);
+        console.log(`   tier: ${violation.lateTier} (${violation.deductionMinutes} min deduction)`);
         console.log(`   description: ${violation.description}`);
         
-        const result = await violationsCollection.insertOne(violation);
+        const result = await violationsCollection().insertOne(violation);
         
         console.log(`✅ Created tardiness violation for ${employeeName} (${employeeId})`);
-        console.log(`   Late minutes: ${lateMinutesRounded}`);
+        console.log(`   Late minutes: ${minutesLate}`);
         console.log(`   Database: ems_violations`);
         console.log(`   Collection: employee_violations`);
         console.log(`   ID: ${result.insertedId}`);
@@ -373,7 +529,7 @@ app.get('/api/employees/:id', async (req, res) => {
 
 // ========== ATTENDANCE ENDPOINTS ==========
 
-// Clock in (UPDATED with proper late detection + active night shift guard)
+// Clock in (UPDATED: tier-based late detection + active night shift guard)
 app.post('/api/attendance/clock-in', async (req, res) => {
     try {
         if (!isConnected) {
@@ -485,53 +641,21 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             }
         }
         
-        // ===== LATE DETECTION =====
-        const settings = await getAttendanceSettings();
-        const gracePeriodMinutes = settings.grace_period_minutes || 15;
-        const lateThresholdTime = settings.late_threshold || "08:16";
+        // ===== LATE DETECTION (based on Deduction (min) tiers) =====
+        const attendanceSettings = await getAttendanceSettings();
+        const lateSettings = await getLateDeductionSettings();
         
-        const clockInMinutes = timeToMinutes(clock_in_time);
-        const lateThresholdMinutes = timeToMinutes(lateThresholdTime);
-        
-        let isLate = false;
-        let shiftType = "Morning";
-        let lateMinutes = 0;
+        const isNightShift = isNightClockIn(clock_in_time);
+        const shiftType = isNightShift ? "Night" : "Morning";
+        const lateInfo = evaluateLateness(clock_in_time, isNightShift, lateSettings, attendanceSettings);
+        const isLate = lateInfo.isLate;
         let violationId = null;
         
-        // Determine shift type based on time
-        // Night shift: 10:00 PM (22:00) to 6:00 AM (06:00) next day
-        const isNightShift = clockInMinutes >= (22 * 60) || clockInMinutes <= (6 * 60);
-        
-        if (isNightShift) {
-            shiftType = "Night";
-            console.log(`🌙 Night shift detected: ${clock_in_time}`);
-            
-            // Night shift late detection: 1:00 AM to 5:00 AM is considered late
-            const nightStart = timeToMinutes("01:00");  // 1:00 AM
-            const nightEnd = timeToMinutes("05:00");    // 5:00 AM
-            
-            if (clockInMinutes >= nightStart && clockInMinutes <= nightEnd) {
-                isLate = true;
-                lateMinutes = clockInMinutes - nightStart;
-                console.log(`⚠️ NIGHT LATE: ${name} at ${clock_in_time} (${Math.ceil(lateMinutes)} min after 1:00 AM)`);
-            } else if (clockInMinutes === 0 || clockInMinutes < nightStart) {
-                // Midnight to 12:59 AM is on time for night shift
-                console.log(`✅ Night shift on time: ${name} at ${clock_in_time} (within grace period)`);
-            } else {
-                console.log(`✅ Night shift on time: ${name} at ${clock_in_time}`);
-            }
+        if (isLate) {
+            console.log(`⚠️ ${shiftType.toUpperCase()} LATE: ${name} at ${clock_in_time} -> ${lateInfo.tierLabel} ` +
+                `(${lateInfo.minutesLate} min after ${lateInfo.workStart}, ${lateInfo.deductionMinutes} min deduction)`);
         } else {
-            // Morning shift (6:01 AM to 9:59 PM)
-            shiftType = "Morning";
-            
-            // Morning shift late detection
-            if (clockInMinutes > lateThresholdMinutes) {
-                isLate = true;
-                lateMinutes = clockInMinutes - lateThresholdMinutes;
-                console.log(`⚠️ MORNING LATE: ${name} at ${clock_in_time} (${Math.ceil(lateMinutes)} min after ${lateThresholdTime})`);
-            } else {
-                console.log(`✅ On time: ${name} at ${clock_in_time}`);
-            }
+            console.log(`✅ On time: ${name} at ${clock_in_time} (${shiftType} shift)`);
         }
         
         // Create attendance record with late status
@@ -544,7 +668,9 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             timestamp: new Date(),
             sync_status: "synced",
             late_status: isLate ? "late" : "on_time",
-            late_minutes: isLate ? Math.ceil(lateMinutes) : 0,
+            late_minutes: isLate ? lateInfo.minutesLate : 0,
+            late_tier: isLate ? lateInfo.tierLabel : null,
+            late_deduction_minutes: isLate ? lateInfo.deductionMinutes : 0,
             shift_type: shiftType.toLowerCase(),
             clock_in_verified: !!face_image_base64,
             clock_in_captured_at: new Date(),
@@ -560,7 +686,7 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         
         console.log(`✅ Clock-in recorded: ${name}`);
         
-        // Create violation if late
+        // Create violation if the matched tier deducts pay
         if (isLate) {
             violationId = await createLateViolation(
                 name,           // employeeName
@@ -568,8 +694,7 @@ app.post('/api/attendance/clock-in', async (req, res) => {
                 clock_in_time,  // clockInTime
                 date,           // attendanceDate
                 shiftType,      // shiftType
-                gracePeriodMinutes,
-                lateMinutes
+                lateInfo        // matched tier details
             );
         }
         
@@ -584,14 +709,16 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         if (isLate) {
             response.late_detection = {
                 is_late: true,
-                late_minutes: Math.ceil(lateMinutes),
+                late_minutes: lateInfo.minutesLate,
+                late_tier: lateInfo.tierLabel,
+                deduction_minutes: lateInfo.deductionMinutes,
                 shift_type: shiftType,
                 violation_created: violationId !== null
             };
             if (violationId) {
                 response.late_detection.violation_id = violationId;
             }
-            response.message += ` (⚠️ ${Math.ceil(lateMinutes)} minute${lateMinutes !== 1 ? 's' : ''} late for ${shiftType} shift)`;
+            response.message += ` (⚠️ ${lateInfo.tierLabel} - ${lateInfo.minutesLate} minute${lateInfo.minutesLate !== 1 ? 's' : ''} after work start, ${shiftType} shift)`;
         }
         
         res.json(response);
@@ -847,7 +974,8 @@ app.put('/api/employees/:employeeId/face', async (req, res) => {
     }
 });
 
-// ========== VIOLATIONS ENDPOINTS (NEW) ==========
+// ========== VIOLATIONS ENDPOINTS ==========
+// (violations are stored in database "ems_violations", collection "employee_violations")
 
 // Get all violations
 app.get('/api/violations', async (req, res) => {
@@ -868,7 +996,7 @@ app.get('/api/violations', async (req, res) => {
             query.date = { $gte: start_date, $lte: end_date };
         }
         
-        const violations = await db.collection('employee_violations')
+        const violations = await violationsCollection()
             .find(query)
             .sort({ createdAt: -1 })
             .toArray();
@@ -901,7 +1029,7 @@ app.get('/api/violations/employee/:employeeName', async (req, res) => {
         const { employeeName } = req.params;
         const { limit } = req.query;
         
-        let cursor = db.collection('employee_violations')
+        let cursor = violationsCollection()
             .find({ employeeName: employeeName })
             .sort({ createdAt: -1 });
         
@@ -947,10 +1075,8 @@ app.post('/api/attendance/check-late-violations', async (req, res) => {
         const attendanceRecords = await db.collection('attendance_records').find(query).toArray();
         console.log(`📊 Found ${attendanceRecords.length} attendance records to check`);
         
-        const settings = await getAttendanceSettings();
-        const gracePeriodMinutes = settings.grace_period_minutes || 15;
-        const lateThresholdTime = settings.late_threshold || "08:16";
-        const lateThresholdMinutes = timeToMinutes(lateThresholdTime);
+        const attendanceSettings = await getAttendanceSettings();
+        const lateSettings = await getLateDeductionSettings();
         
         let processed = 0;
         let lateDetected = 0;
@@ -967,33 +1093,18 @@ app.post('/api/attendance/check-late-violations', async (req, res) => {
                 
                 if (!employeeName || !clockInTime) continue;
                 
-                const clockInMinutes = timeToMinutes(clockInTime);
-                let isLate = false;
-                let lateMinutes = 0;
-                let shiftType = "Morning";
+                const isNightShift = isNightClockIn(clockInTime);
+                const shiftType = isNightShift ? "Night" : "Morning";
+                const lateInfo = evaluateLateness(clockInTime, isNightShift, lateSettings, attendanceSettings);
                 
-                const isNightShift = clockInMinutes >= (22 * 60) || clockInMinutes <= (6 * 60);
-                shiftType = isNightShift ? "Night" : "Morning";
-                
-                if (!isNightShift) {
-                    if (clockInMinutes > lateThresholdMinutes) {
-                        isLate = true;
-                        lateMinutes = clockInMinutes - lateThresholdMinutes;
-                    }
-                } else {
-                    const nightStart = timeToMinutes("01:00");
-                    const nightEnd = timeToMinutes("05:00");
-                    if (clockInMinutes >= nightStart && clockInMinutes <= nightEnd) {
-                        isLate = true;
-                        lateMinutes = clockInMinutes - nightStart;
-                    }
-                }
-                
-                if (isLate) {
+                if (lateInfo.isLate) {
                     lateDetected++;
                     
-                    const existingViolation = await db.collection('employee_violations').findOne({
-                        employeeName: employeeName,
+                    const existingViolation = await violationsCollection().findOne({
+                        $or: [
+                            { employeeId: record.employee_id },
+                            { employeeName: employeeName }
+                        ],
                         date: attendanceDate,
                         violationType: "Tardiness"
                     });
@@ -1005,8 +1116,7 @@ app.post('/api/attendance/check-late-violations', async (req, res) => {
                             clockInTime,
                             attendanceDate,
                             shiftType,
-                            gracePeriodMinutes,
-                            lateMinutes
+                            lateInfo
                         );
                         
                         if (violationId) {
@@ -1020,18 +1130,18 @@ app.post('/api/attendance/check-late-violations', async (req, res) => {
                         { 
                             $set: { 
                                 late_status: "late",
-                                late_minutes: Math.ceil(lateMinutes)
+                                late_minutes: lateInfo.minutesLate,
+                                late_tier: lateInfo.tierLabel,
+                                late_deduction_minutes: lateInfo.deductionMinutes
                             }
                         }
                     );
                 } else {
-                    // Update as on time if not already marked
-                    if (!record.late_status) {
-                        await db.collection('attendance_records').updateOne(
-                            { _id: record._id },
-                            { $set: { late_status: "on_time" } }
-                        );
-                    }
+                    // Mark as on time (also corrects records previously flagged late by the old fixed threshold)
+                    await db.collection('attendance_records').updateOne(
+                        { _id: record._id },
+                        { $set: { late_status: "on_time", late_minutes: 0 } }
+                    );
                 }
                 
                 if (processed % 10 === 0) {
@@ -1064,6 +1174,36 @@ app.post('/api/attendance/check-late-violations', async (req, res) => {
             success: false, 
             message: error.message 
         });
+    }
+});
+
+// Preview which tier a clock-in time falls into (read-only, handy for testing your tier settings)
+//   GET /api/attendance/late-preview?time=08:31
+//   GET /api/attendance/late-preview?time=00:40&shift=night
+app.get('/api/attendance/late-preview', async (req, res) => {
+    try {
+        const time = String(req.query.time || '');
+        if (!/^\d{1,2}:\d{2}(:\d{2})?$/.test(time)) {
+            return res.status(400).json({
+                success: false,
+                message: "Use ?time=HH:MM (24-hour), e.g. ?time=08:31"
+            });
+        }
+        const isNight = req.query.shift
+            ? String(req.query.shift).toLowerCase() === 'night'
+            : isNightClockIn(time);
+        const attendanceSettings = await getAttendanceSettings();
+        const lateSettings = await getLateDeductionSettings();
+        const lateInfo = evaluateLateness(time, isNight, lateSettings, attendanceSettings);
+        res.json({
+            success: true,
+            clock_in_time: time,
+            shift_type: isNight ? "Night" : "Morning",
+            creates_violation: lateInfo.isLate,
+            result: lateInfo
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
@@ -1221,6 +1361,7 @@ app.get('/', (req, res) => {
             'GET /api/violations',
             'GET /api/violations/employee/:employeeName',
             'POST /api/attendance/check-late-violations',
+            'GET /api/attendance/late-preview',
             'GET /api/hardware/status/:device_id',
             'POST /api/hardware/register',
             'PUT /api/hardware/authorize',
@@ -1512,6 +1653,7 @@ app.listen(port, () => {
     console.log(`   GET  /api/violations`);
     console.log(`   GET  /api/violations/employee/:employeeName`);
     console.log(`   POST /api/attendance/check-late-violations`);
+    console.log(`   GET  /api/attendance/late-preview?time=HH:MM`);
     console.log(`   POST /api/hardware/register`);
     console.log(`   GET  /api/hardware/status/:id`);
     console.log(`   PUT  /api/hardware/authorize`);
