@@ -611,14 +611,26 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         
         // Check if already clocked in today
         const clientRecordId = local_id ? `${employee_id}:${local_id}` : null;
-        const existing = clientRecordId
-            ? await db.collection('attendance_records').findOne({ $or: [
-                { client_record_id: clientRecordId }, { employee_id, date }, { name, date }
-            ] })
-            : await db.collection('attendance_records').findOne({ employee_id, date });
+        // Every condition is scoped to the same date, so a reused local_id can never match another day.
+        const existing = await db.collection('attendance_records').findOne({
+            date,
+            $or: [
+                ...(employee_id ? [{ employee_id }] : []),
+                { name },
+                ...(clientRecordId ? [{ client_record_id: clientRecordId }] : [])
+            ]
+        });
         
         if (existing) {
-            console.log(`⚠️ Already clocked in today: ${name}`);
+            console.log(`⚠️ Already clocked in today: ${name}`, {
+                matched_id: existing._id,
+                matched_employee_id: existing.employee_id,
+                matched_date: existing.date,
+                matched_client_record_id: existing.client_record_id,
+                request_employee_id: employee_id,
+                request_local_id: local_id,
+                request_date: date
+            });
             if (clientRecordId && !existing.client_record_id) {
                 await db.collection('attendance_records').updateOne(
                     { _id: existing._id },
@@ -823,7 +835,7 @@ app.post('/api/attendance/clock-out', async (req, res) => {
         
         const clientRecordId = local_id ? `${employee_id}:${local_id}` : null;
         const filter = clientRecordId
-            ? { client_record_id: clientRecordId }
+            ? { client_record_id: clientRecordId, date }
             : { employee_id, date, $or: [
                 { clock_out_time: { $exists: false } },
                 { clock_out_time: null },
@@ -1338,7 +1350,7 @@ app.post('/api/sync/attendance', async (req, res) => {
                     ? `${record.employee_id}:${record.local_id}` : null;
                 const filter = clientRecordId
                     ? { $or: [
-                        { client_record_id: clientRecordId },
+                        { client_record_id: clientRecordId, date: record.date },
                         { employee_id: record.employee_id, date: record.date },
                         { name: record.name, date: record.date }
                     ] }
