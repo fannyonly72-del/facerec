@@ -141,6 +141,67 @@ function isNightClockIn(clockInTime) {
     return minutes >= (22 * 60) || minutes <= (6 * 60);
 }
 
+// ===== CLOCK-IN WINDOW GUARD START =====
+// Employees may only clock in inside these windows (Company Calendar > General Settings / Night Shift):
+//   Day shift   : clock_in_start .. clock_in_end   (default 08:00 - 17:00), never later than clock_out_start
+//   Night shift : night_shift_start .. night_shift_end, crossing midnight (default 22:00 - 06:00, end exclusive)
+// Anything else (17:01 - 21:59 and 06:00 - 07:59 with the defaults) is rejected.
+// Pure function (no DB access) so it can be unit-tested.
+function formatClock12(minutes) {
+    const wrapped = ((minutes % 1440) + 1440) % 1440;
+    const h24 = Math.floor(wrapped / 60);
+    const m = String(wrapped % 60).padStart(2, '0');
+    const suffix = h24 >= 12 ? 'PM' : 'AM';
+    const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+    return `${String(h12).padStart(2, '0')}:${m} ${suffix}`;
+}
+
+function checkClockInWindow(clockInTime, attendanceSettings) {
+    const settings = attendanceSettings || {};
+    const pick = (value, fallback) => {
+        const minutes = hhmmToMinutes(value);
+        return minutes === null ? fallback : minutes;
+    };
+
+    const dayStart = pick(settings.clock_in_start, 8 * 60);
+    let dayEnd = pick(settings.clock_in_end, 17 * 60);
+    const clockOutStart = hhmmToMinutes(settings.clock_out_start);
+    if (clockOutStart !== null && clockOutStart < dayEnd) dayEnd = clockOutStart; // no clock-in once clock-out time begins
+
+    const nightEnabled = settings.night_shift_enabled !== false;
+    const nightStart = pick(settings.night_shift_start, 22 * 60);
+    const nightEnd = pick(settings.night_shift_end, 6 * 60);
+
+    const windows = {
+        day: { start: minutesToHHMM(dayStart), end: minutesToHHMM(dayEnd) },
+        night: nightEnabled ? { start: minutesToHHMM(nightStart), end: minutesToHHMM(nightEnd) } : null
+    };
+    const allowedText = `Clock-in is only allowed ${formatClock12(dayStart)} - ${formatClock12(dayEnd)} (day shift)` +
+        (nightEnabled ? ` or ${formatClock12(nightStart)} - ${formatClock12(nightEnd)} (night shift)` : '') + '.';
+
+    const clockIn = hhmmToMinutes(clockInTime);
+    if (clockIn === null) {
+        return { allowed: false, shift: null, windows, message: `Invalid clock-in time. ${allowedText}` };
+    }
+
+    if (clockIn >= dayStart && clockIn <= dayEnd) {
+        return { allowed: true, shift: 'day', windows, message: null };
+    }
+    if (nightEnabled) {
+        const inNight = nightStart > nightEnd
+            ? (clockIn >= nightStart || clockIn < nightEnd)     // crosses midnight
+            : (clockIn >= nightStart && clockIn < nightEnd);
+        if (inNight) return { allowed: true, shift: 'night', windows, message: null };
+    }
+    return {
+        allowed: false,
+        shift: null,
+        windows,
+        message: `${allowedText} Your clock-in time was ${formatClock12(clockIn)}.`
+    };
+}
+// ===== CLOCK-IN WINDOW GUARD END =====
+
 async function getLateDeductionSettings() {
     try {
         if (!isConnected) return DEFAULT_LATE_SETTINGS;
@@ -543,9 +604,10 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         
         console.log(`⏰ Clock-in: ${name} at ${clock_in_time} on ${date}`);
         
-        // Parse clock-in hour to determine if it's night shift
-        const clockInHour = parseInt(clock_in_time.split(':')[0]);
-        const isNightShiftClockIn = (clockInHour >= 22 || clockInHour <= 6);
+        // Which shift window does this clock-in fall into? (windows come from attendance_settings)
+        const attendanceSettings = await getAttendanceSettings();
+        const windowCheck = checkClockInWindow(clock_in_time, attendanceSettings);
+        const isNightShiftClockIn = windowCheck.shift === 'night';
         
         // Check if already clocked in today
         const clientRecordId = local_id ? `${employee_id}:${local_id}` : null;
@@ -570,6 +632,17 @@ app.post('/api/attendance/clock-in', async (req, res) => {
             });
         }
  
+        // ===== CHECK 0: clock-in window (day shift / night shift only) =====
+        if (!windowCheck.allowed) {
+            console.log(`⛔ Clock-in rejected for ${name} at ${clock_in_time}: outside the allowed clock-in windows`);
+            return res.json({
+                success: false,
+                code: "OUTSIDE_CLOCK_IN_WINDOW",
+                message: windowCheck.message,
+                clock_in_windows: windowCheck.windows
+            });
+        }
+
         // ===== CHECK 1: Active night shift (not clocked out) =====
         const yesterday = new Date(`${date}T00:00:00.000Z`);
         yesterday.setDate(yesterday.getDate() - 1);
@@ -642,10 +715,9 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         }
         
         // ===== LATE DETECTION (based on Deduction (min) tiers) =====
-        const attendanceSettings = await getAttendanceSettings();
         const lateSettings = await getLateDeductionSettings();
         
-        const isNightShift = isNightClockIn(clock_in_time);
+        const isNightShift = isNightShiftClockIn; // same window decision as the guard above
         const shiftType = isNightShift ? "Night" : "Morning";
         const lateInfo = evaluateLateness(clock_in_time, isNightShift, lateSettings, attendanceSettings);
         const isLate = lateInfo.isLate;
@@ -1259,6 +1331,7 @@ app.post('/api/sync/attendance', async (req, res) => {
         console.log(`🔄 Syncing ${pending_records.length} pending records`);
         
         const results = [];
+        const syncSettings = await getAttendanceSettings();
         for (const record of pending_records || []) {
             try {
                 const clientRecordId = record.local_id && record.employee_id
@@ -1273,6 +1346,26 @@ app.post('/api/sync/attendance', async (req, res) => {
                         { employee_id: record.employee_id, date: record.date },
                         { name: record.name, date: record.date }
                     ] };
+                // Offline-saved clock-ins must respect the clock-in windows too. Records that already
+                // exist on the server (e.g. a later clock-out sync) are not re-checked.
+                if (record.clock_in_time) {
+                    const alreadyOnServer = await db.collection('attendance_records')
+                        .findOne(filter, { projection: { _id: 1 } });
+                    if (!alreadyOnServer) {
+                        const windowCheck = checkClockInWindow(record.clock_in_time, syncSettings);
+                        if (!windowCheck.allowed) {
+                            console.log(`⛔ Sync rejected for ${record.name} at ${record.clock_in_time}: outside the allowed clock-in windows`);
+                            results.push({
+                                id: record.local_id,
+                                success: false,
+                                rejected: true,
+                                code: "OUTSIDE_CLOCK_IN_WINDOW",
+                                message: windowCheck.message
+                            });
+                            continue;
+                        }
+                    }
+                }
                 const set = {
                     employee_id: record.employee_id,
                     name: record.name,
